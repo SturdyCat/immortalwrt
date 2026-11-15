@@ -108,12 +108,23 @@ chmod 0755 files/etc/uci-defaults/99-ax3000t-zram
 #        /sys/bus/usb 不存在，/dev 下只有 ubiblock0_0，没有 sd* / mmcblk* / nvme*
 #      - 无线是 SoC 内置 mt798x-wmac（mt7915e 驱动），交换芯片是 MDIO 上的
 #        MT7531，都不走 PCIe；根文件系统是 squashfs + UBIFS + overlay
-#      - 内核里 USB/PCI/MMC/SCSI/EXT4/F2FS 却是 built-in (=y)，常驻内核内存
+#      - 内核里 USB/MMC/SCSI/EXT4/F2FS 却是 built-in (=y)，常驻内核内存
 #        （实测内核 10496K code + 7268K rodata），且开机白白发一遍初始化
 #     generic/config-* 里这些总开关本来就是关的，只要把 filogic/config-* 里
 #     的 =y 改回 "# CONFIG_X is not set"，Kconfig 依赖门会自动摘掉所有子项。
 #
-#     明确保留（不要因为"不用容器"就误剪）：
+#     明确保留（不要因为"没有硬件"就误剪）：
+#       PCI（仅 core 总开关）           mt76 源码 mt7915/Makefile 里
+#                                       mt7915e-y := pci.o init.o ...，pci.o
+#                                       无条件编译；它用到的 PCI_IRQ_ALL_TYPES
+#                                       和 pci_free_irq_vectors 都在内核
+#                                       include/linux/pci.h 的
+#                                       #ifdef CONFIG_PCI 块内。关掉会让
+#                                       kmod-mt798x-wmac 编译失败（GHA 实测）。
+#                                       保留 core 但把 PCIe 控制器 / AER /
+#                                       ASPM / PME / MSI / DOMAINS / DEBUG
+#                                       全部关掉：设备无 PCIe 节点，运行时没有
+#                                       初始化开销，常驻增量远小于剪掉的部分。
 #       SWIOTLB                         MT7981 DMA bounce buffer，实测 1MB
 #       MTD_UBI / UBIFS_FS / OVERLAY_FS  squashfs+UBI 根文件系统必需
 #       CGROUPS / NAMESPACES / SECCOMP   procd ujail 服务隔离要用，非 Docker 专属
@@ -141,9 +152,10 @@ kopt_off() {
     return 0
 }
 
+# CONFIG_PCI 本身必须保留（见上方说明），这里只关它的子项与其余无用总线。
 for sym in \
     USB_SUPPORT \
-    PCI PCIEAER PCIEASPM PCIEASPM_PERFORMANCE PCIEPORTBUS PCIE_MEDIATEK_GEN3 \
+    PCIEAER PCIEASPM PCIEASPM_PERFORMANCE PCIEPORTBUS PCIE_MEDIATEK_GEN3 \
     PCIE_PME PCI_DEBUG PCI_DOMAINS PCI_DOMAINS_GENERIC PCI_MSI \
     MMC MMC_BLOCK MMC_CQHCI MMC_HSQ MMC_MTK \
     SCSI SCSI_COMMON BLK_DEV_SD BLK_DEV_LOOP \
@@ -156,33 +168,46 @@ done
 
 # generic/config-* 里还散落着 USB/PCI/SCSI 子项的 savedefconfig 残留（=y）。
 # 总开关关闭后内核 Kconfig 本就会忽略它们，这里显式清掉，让配置干净且可校验。
+# 例外：CONFIG_PCI 本身要留，否则 mt7915/pci.c 编译不过。
 for f in $KCONFIG_FILES; do
     [ -f "$f" ] || continue
     for sym in $(grep -oE '^CONFIG_(USB|USBIP|PCI|PCIE|MMC|SCSI)[A-Z0-9_]*=' "$f" \
                  | sed 's/^CONFIG_//; s/=$//' | sort -u); do
+        if [ "$sym" = "PCI" ]; then
+            continue
+        fi
         kopt_off "$sym"
     done
 done
 
 # 自检：确认该关的已关、该留的还在，避免上游 config 结构变化导致剪裁静默失效
 step "自检内核剪裁结果"
-for s in USB_SUPPORT PCI MMC SCSI EXT4_FS F2FS_FS DEBUG_KERNEL DEBUG_FS; do
+for s in USB_SUPPORT MMC SCSI EXT4_FS F2FS_FS DEBUG_KERNEL DEBUG_FS; do
     if grep -q "^CONFIG_${s}=y" $KCONFIG_FILES 2>/dev/null; then
         echo "错误：CONFIG_${s} 仍为 y，剪裁未生效" >&2
         exit 1
     fi
 done
-for s in SWIOTLB MTD_UBI UBIFS_FS OVERLAY_FS; do
+for s in PCI SWIOTLB MTD_UBI UBIFS_FS OVERLAY_FS; do
     if ! grep -q "^CONFIG_${s}=y" $KCONFIG_FILES 2>/dev/null; then
-        echo "错误：必需内核符号 CONFIG_${s} 丢失，固件可能无法启动" >&2
+        echo "错误：必需内核符号 CONFIG_${s} 丢失" >&2
+        if [ "$s" = "PCI" ]; then
+            echo "      CONFIG_PCI 关闭会让 mt76 的 mt7915/pci.c 编译失败" >&2
+        else
+            echo "      固件可能无法启动" >&2
+        fi
         exit 1
     fi
 done
-if grep -qE '^CONFIG_(USB|USBIP|PCI|PCIE|MMC|SCSI)[A-Z0-9_]*=(y|m)$' $KCONFIG_FILES 2>/dev/null; then
-    echo "错误：仍残留无用总线的 =y/=m 符号" >&2
+# 除 CONFIG_PCI=y 这一个编译期依赖外，所有 USB/PCIe/MMC/SCSI 子项都应为 n
+leftover=$(grep -hE '^CONFIG_(USB|USBIP|PCI|PCIE|MMC|SCSI)[A-Z0-9_]*=(y|m)$' \
+           $KCONFIG_FILES 2>/dev/null | grep -v '^CONFIG_PCI=y$' || true)
+if [ -n "$leftover" ]; then
+    echo "错误：仍残留无用总线的 =y/=m 符号：" >&2
+    echo "$leftover" >&2
     exit 1
 fi
-echo "    自检通过：无用子系统已关闭，根文件系统 / DMA / 加速相关符号保持 y"
+echo "    自检通过：无用子系统已关闭；保留 PCI core（mt76 编译依赖），根文件系统 / DMA 相关符号保持 y"
 
 # ---------------------------------------------------------------------------
 # 6) zram 场景的内存调优
@@ -279,7 +304,7 @@ step "剪裁完成"
 echo "    target/linux : $(ls target/linux | tr '\n' ' ')"
 echo "    feeds        : packages / luci（见 feeds.conf.default）"
 echo "    设备         : xiaomi_mi-router-ax3000t（由 ax3000t.config 唯一勾选）"
-echo "    内核         : 无 USB/PCI/MMC/SCSI/EXT4/F2FS；zram 后端 lz4 + zstd，默认 lz4"
+echo "    内核         : 无 USB/MMC/SCSI/EXT4/F2FS 及全部 PCIe 子项；保留 PCI core（mt76 编译依赖）；zram lz4 + zstd，默认 lz4"
 echo "    禁用服务包   : Docker / Tailscale / ZeroTier / mwan3（见 ax3000t.config + workflow 守卫）"
 echo "    补丁适配     : firewall4 fullcone 剥离失效配置 hunk，uci-defaults 补回默认值"
 echo "    首次开机     : uci-defaults 设 argon 主题 / zram 算法 lz4 / fullcone 默认值；sysctl.d 调 zram"

@@ -145,14 +145,18 @@ jobs:
             exit 1
           fi
 
-          echo "=== 内核剪裁符号校验 ==="
-          for s in USB_SUPPORT PCI MMC SCSI EXT4_FS F2FS_FS DEBUG_KERNEL DEBUG_FS; do
+          echo "=== 内核剪裁符号校验（保留 PCI core 供 mt76 编译） ==="
+          for s in USB_SUPPORT MMC SCSI EXT4_FS F2FS_FS DEBUG_KERNEL DEBUG_FS; do
             if grep -q "^CONFIG_${s}=y" \
                  target/linux/mediatek/filogic/config-* target/linux/generic/config-* 2>/dev/null; then
               echo "错误：内核仍编译了 AX3000T 不存在的子系统 CONFIG_${s}" >&2
               exit 1
             fi
           done
+          grep -q '^CONFIG_PCI=y' target/linux/mediatek/filogic/config-* 2>/dev/null || {
+            echo "错误：CONFIG_PCI 未保留，mt76 的 mt7915/pci.c 会编译失败" >&2
+            exit 1
+          }
 
           echo "=== zram 后端校验（lz4 + zstd，默认 lz4，无 lzo / lz4hc） ==="
           for s in LZ4 ZSTD; do
