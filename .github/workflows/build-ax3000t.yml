@@ -54,7 +54,7 @@ jobs:
                 ecj fastjar flex gawk gettext gcc-multilib g++-multilib git gperf \
                 haveged help2man intltool libc6-dev-i386 libelf-dev libglib2.0-dev \
                 libgmp-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev \
-                libreadline-dev libssl-dev libtool lzip lzma ninja-build p7zip-full \
+                libreadline-dev libssl-dev libtool lzip lzma ninja-build 7zip p7zip-full \
                 patch pkgconf python3 python3-pyelftools python3-setuptools qemu-utils \
                 rsync scons squashfs-tools subversion swig texinfo unzip vim wget \
                 xmlto xxd zlib1g-dev zstd file"
@@ -218,14 +218,18 @@ jobs:
           echo "=== 缓存目录体积 ==="
           du -sh .ccache dl 2>/dev/null || true
 
-      - name: 收集产物
+      - name: 收集产物并打包为 7z
+        id: collect
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+          RUN_NO: ${{ github.run_number }}
         run: |
           set -e
           if [ ! -d "$SRC_DIR" ]; then
             echo "错误：未找到 $SRC_DIR" >&2
             exit 1
           fi
-          mkdir -p artifacts
+          mkdir -p artifacts release
           # 仅取 AX3000T stock layout 产物，排除 ubootmod 变体
           find "$SRC_DIR" -maxdepth 1 -type f \
                -name '*ax3000t*' ! -name '*ubootmod*' \
@@ -240,6 +244,31 @@ jobs:
                 -printf '%f\n' | sort | xargs sha256sum > sha256sums.txt)
           echo "=== 产物清单 ==="
           ls -lh artifacts/
+
+          # Release 与 Artifact 统一发布一个 7z 包：固件 + buildinfo + 校验清单。
+          # 未手填版本号时用 snapshot-r<run_number> 自动发版，避免出现
+          # 「构建成功但 Release 为空」；手填版本号则沿用自定义 tag。
+          TAG="$INPUT_TAG"
+          [ -n "$TAG" ] || TAG="snapshot-r${RUN_NO}"
+          SAFE=$(printf '%s' "$TAG" | tr -c 'A-Za-z0-9._-' '_')
+          PKG="immortalwrt-ax3000t-${SAFE}.7z"
+
+          # ubuntu-24.04 的 7zip 包提供 7z / 7zz；p7zip-full 是旧版兼容项。
+          SZ=""
+          for c in 7z 7zz; do
+            if command -v "$c" >/dev/null 2>&1; then SZ="$c"; break; fi
+          done
+          if [ -z "$SZ" ]; then
+            sudo apt-get install -y --no-install-recommends 7zip \
+              || sudo apt-get install -y --no-install-recommends p7zip-full
+            SZ=$(command -v 7z || command -v 7zz)
+          fi
+          (cd artifacts && "$SZ" a -t7z -mx=5 -mmt=on -bso0 -bsp0 "../release/$PKG" ./*)
+          (cd release && sha256sum "$PKG" > "${PKG}.sha256")
+          echo "=== 7z 发布包 ==="
+          ls -lh release/
+
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
           {
             echo "### AX3000T 专属固件"
             echo ""
@@ -248,26 +277,38 @@ jobs:
             echo '```'
             ls -lh artifacts/
             echo '```'
+            echo ""
+            echo "发布包：\`$PKG\`"
+            echo '```'
+            cat "release/${PKG}.sha256"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 上传固件
         uses: actions/upload-artifact@v4
         with:
           name: immortalwrt-ax3000t-${{ github.run_number }}
-          path: artifacts/
+          path: |
+            artifacts/
+            release/
           retention-days: 30
           compression-level: 0
 
       - name: 发布 Release
-        if: ${{ inputs.release_tag != '' }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.release_tag }}
-          name: AX3000T ${{ inputs.release_tag }}
+          tag_name: ${{ steps.collect.outputs.release_tag }}
+          name: AX3000T ${{ steps.collect.outputs.release_tag }}
           body: |
             ImmortalWrt AX3000T 单设备构建（mediatek/filogic，stock layout）。
             内置 OpenClash、rtp2httpd、Argon 主题及设备当前在用插件；不含其它机型与其它主题。
-          files: artifacts/*
+
+            下载 `immortalwrt-ax3000t-*.7z` 后用 7-Zip 解压，内含固件、
+            buildinfo、展开配置与 sha256sums.txt；`*.7z.sha256` 用于校验压缩包。
+          files: |
+            release/*.7z
+            release/*.7z.sha256
+          fail_on_unmatched_files: true
 
       # 失败也保存：这次是在 package_compile 阶段挂的，dl 与 ccache 已经攒下，
       # 存下来后修好补丁重跑就几乎不用重新下载 / 重新编译。
