@@ -201,10 +201,85 @@ vm.vfs_cache_pressure=200
 EOF
 chmod 0644 files/etc/sysctl.d/99-ax3000t-memory.conf
 
+# ---------------------------------------------------------------------------
+# 7) 适配 firewall4 的 fullcone 补丁（上游源码漂移导致构建中断）
+#
+#    GHA 实测报错：
+#      patching file root/etc/config/firewall
+#      Hunk #1 FAILED at 5.
+#      ERROR: package/network/config/firewall4 failed to build.
+#    根因：Makefile 把 firewall4 固定在 2026-11-08~3722eadc，上游在这个版本
+#    重写了 root/etc/config/firewall 的 defaults 段（加了 syn_flood，删掉了
+#    disable_ipv6 那两行注释），补丁第 1 个 hunk 的上下文不再匹配；而另外
+#    3 个文件（ruleset.uc / zone-fullcone.uc / fw4.uc）的 hunk 都能正常应用，
+#    只是 GNU patch 只要有一个 hunk 失败就让整个包 compile 返回 Error 1。
+#
+#    这一处改的只是"默认 UCI 配置"，不是代码。这里把该文件段从补丁里剥掉、
+#    保留全部代码改动，再用 files/ 下的 uci-defaults 在首次开机写入同样的
+#    4 个 option，语义与原补丁一致；上游以后再改默认配置也不会再次打断构建。
+#    若上游已自行修好该 hunk，本步骤会自动跳过。
+# ---------------------------------------------------------------------------
+step "适配 firewall4 fullcone 补丁：剥离失效的默认配置 hunk"
+
+FW4_PATCH="package/network/config/firewall4/patches/001-firewall4-add-support-for-fullcone-nat.patch"
+
+mkdir -p files/etc/uci-defaults
+cat > files/etc/uci-defaults/99-ax3000t-fullcone <<'EOF'
+#!/bin/sh
+# 对齐 ImmortalWrt fullcone 补丁原本写入 root/etc/config/firewall 的默认值。
+# 该 hunk 已由构建脚本剥离（上游配置漂移），这里改在首次开机补齐。
+# sysupgrade 保留配置时 uci-defaults 不重跑，已有配置不会被覆盖。
+# fw4 启动时会用 nft -c 探测 fullcone 表达式，内核不支持则自动全局禁用，
+# 不会因为这几个 option 导致防火墙起不来。
+uci -q set firewall.@defaults[0].flow_offloading='1'
+uci -q set firewall.@defaults[0].flow_offloading_hw='1'
+uci -q set firewall.@defaults[0].fullcone='1'
+uci -q set firewall.@defaults[0].fullcone6='0'
+uci -q commit firewall
+exit 0
+EOF
+chmod 0755 files/etc/uci-defaults/99-ax3000t-fullcone
+
+if [ -f "$FW4_PATCH" ]; then
+    if grep -q '^--- a/root/etc/config/firewall$' "$FW4_PATCH"; then
+        tmp_patch="$(mktemp)"
+        cp "$FW4_PATCH" "$tmp_patch"
+        # 按 "--- <file>" 切分文件段，只丢掉 root/etc/config/firewall 那一段；
+        # 邮件头、diffstat、其余 3 个文件的全部 hunk 原样保留。
+        awk '
+            /^--- (a\/|\/dev\/)/ {
+                skip = ($0 == "--- a/root/etc/config/firewall") ? 1 : 0
+            }
+            !skip { print }
+        ' "$tmp_patch" > "$FW4_PATCH"
+        rm -f "$tmp_patch"
+        echo "    已剥离 root/etc/config/firewall 文件段（代码 hunk 全部保留）"
+    else
+        echo "    上游已自行适配该 hunk，无需剥离"
+    fi
+    # 自检：代码改动必须完整保留、失效的配置段必须消失、备份文件不得留在 patches/
+    for f in root/usr/share/ucode/fw4.uc \
+             root/usr/share/firewall4/templates/ruleset.uc \
+             root/usr/share/firewall4/templates/zone-fullcone.uc; do
+        grep -q "^+++ b/${f}$" "$FW4_PATCH" || {
+            echo "错误：剥离后补丁丢失了 ${f} 的代码改动" >&2
+            exit 1
+        }
+    done
+    if grep -q '^--- a/root/etc/config/firewall$' "$FW4_PATCH"; then
+        echo "错误：失效的配置 hunk 仍留在补丁里" >&2
+        exit 1
+    fi
+    echo "    自检通过：fullcone 代码支持完整保留"
+else
+    echo "    警告：未找到 ${FW4_PATCH}（上游可能已重构 firewall4），跳过剥离" >&2
+fi
+
 step "剪裁完成"
 echo "    target/linux : $(ls target/linux | tr '\n' ' ')"
 echo "    feeds        : packages / luci（见 feeds.conf.default）"
 echo "    设备         : xiaomi_mi-router-ax3000t（由 ax3000t.config 唯一勾选）"
 echo "    内核         : 无 USB/PCI/MMC/SCSI/EXT4/F2FS；zram 后端 lz4 + zstd，默认 lz4"
 echo "    禁用服务包   : Docker / Tailscale / ZeroTier / mwan3（见 ax3000t.config + workflow 守卫）"
-echo "    首次开机     : uci-defaults 设 argon 主题 + zram 算法 lz4；sysctl.d 调 zram"
+echo "    补丁适配     : firewall4 fullcone 剥离失效配置 hunk，uci-defaults 补回默认值"
+echo "    首次开机     : uci-defaults 设 argon 主题 / zram 算法 lz4 / fullcone 默认值；sysctl.d 调 zram"

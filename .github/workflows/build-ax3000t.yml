@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       use_cache:
-        description: '复用 dl 下载缓存（加速二次构建）'
+        description: '复用 dl 下载缓存 + ccache 编译缓存（失败重跑几乎不用重编）'
         type: boolean
         default: true
       release_tag:
@@ -24,6 +24,9 @@ concurrency:
 env:
   TZ: Asia/Shanghai
   SRC_DIR: bin/targets/mediatek/filogic
+  # rules.mk 在 CONFIG_CCACHE=y 时把缓存目录设为 $(TOPDIR)/.ccache，
+  # 这里只限制体积；runner 清理后约 14GB 可用，2G 足够一轮全量编译。
+  CCACHE_MAXSIZE: 2G
 
 jobs:
   build:
@@ -64,21 +67,43 @@ jobs:
             fi
           done
           sudo apt-get install -y --no-install-recommends $LIST
+          ccache --version | head -1
 
-      - name: 恢复下载缓存
+      - name: 准备缓存目录
+        run: mkdir -p dl .ccache
+
+      # 缓存分两级：
+      #   dl      —— 所有上游源码包，避免重复下载；
+      #   .ccache —— 所有 C/C++ 编译结果（host 工具 / 交叉工具链 / 内核 / 软件包）。
+      # ccache 按编译输入内容寻址，跨配置、跨 commit 复用都安全，
+      # 比直接缓存 build_dir 更轻（不缓存数 GB 的中间产物与易失效的 stamp）。
+      # key 末尾带 run_attempt：rerun 时用新 key 写回，restore-keys 仍能命中上一次。
+      - name: 恢复下载缓存（dl）
         if: ${{ inputs.use_cache }}
         uses: actions/cache/restore@v4
         with:
           path: dl
-          key: ax3000t-dl-${{ hashFiles('ax3000t.config', 'feeds.conf.default', 'scripts/ax3000t-prune.sh') }}-${{ github.run_number }}
+          key: ax3000t-dl-${{ hashFiles('ax3000t.config', 'feeds.conf.default', 'scripts/ax3000t-prune.sh') }}-${{ github.run_number }}-${{ github.run_attempt }}
           restore-keys: |
+            ax3000t-dl-${{ hashFiles('ax3000t.config', 'feeds.conf.default', 'scripts/ax3000t-prune.sh') }}-${{ github.run_number }}-
             ax3000t-dl-${{ hashFiles('ax3000t.config', 'feeds.conf.default', 'scripts/ax3000t-prune.sh') }}-
             ax3000t-dl-
+
+      - name: 恢复 ccache 编译缓存
+        if: ${{ inputs.use_cache }}
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ax3000t-ccache-${{ hashFiles('ax3000t.config', 'feeds.conf.default', 'scripts/ax3000t-prune.sh') }}-${{ github.run_number }}-${{ github.run_attempt }}
+          restore-keys: |
+            ax3000t-ccache-${{ hashFiles('ax3000t.config', 'feeds.conf.default', 'scripts/ax3000t-prune.sh') }}-${{ github.run_number }}-
+            ax3000t-ccache-${{ hashFiles('ax3000t.config', 'feeds.conf.default', 'scripts/ax3000t-prune.sh') }}-
+            ax3000t-ccache-
 
       - name: 更新 feeds（仅 packages / luci）
         run: ./scripts/feeds update -a
 
-      - name: 构建时剪裁（架构 / subtarget / 主题 / 内核）
+      - name: 构建时剪裁（架构 / subtarget / 主题 / 内核 / 补丁适配）
         run: |
           chmod +x scripts/ax3000t-prune.sh
           ./scripts/ax3000t-prune.sh
@@ -90,12 +115,29 @@ jobs:
         run: |
           cp ax3000t.config .config
           make defconfig
+          # CCACHE 的 prompt 受 CONFIG_DEVEL 控制，本构建刻意关闭了 DEVEL，
+          # 某些版本 make defconfig 会丢掉 seed 里的 CONFIG_CCACHE=y。
+          # rules.mk 只读取这个变量本身，所以在 defconfig 之后兜底写回。
+          if ! grep -q '^CONFIG_CCACHE=y' .config; then
+            sed -i -e '/^# CONFIG_CCACHE is not set$/d' -e '/^CONFIG_CCACHE=/d' .config
+            echo 'CONFIG_CCACHE=y' >> .config
+            echo "已兜底写回 CONFIG_CCACHE=y"
+          else
+            echo "CONFIG_CCACHE=y 由 make defconfig 保留"
+          fi
+          echo "=== ccache 配置项 ==="
+          grep 'CONFIG_CCACHE' .config || true
           echo "=== 已启用的设备 ==="
           grep '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y' .config || true
 
-      - name: 校验剪裁结果（单设备 / 内核符号 / zram 后端 / 禁用包）
+      - name: 校验剪裁结果（单设备 / 内核符号 / zram 后端 / 禁用包 / ccache）
         run: |
           set -e
+          grep -q '^CONFIG_CCACHE=y' .config || {
+            echo "错误：ccache 未启用，二次构建会全量重编" >&2
+            exit 1
+          }
+
           count=$(grep -c '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y' .config || true)
           echo "启用设备数：$count"
           if [ "$count" -ne 1 ]; then
@@ -158,7 +200,19 @@ jobs:
         run: make download -j$(nproc) || make download -j1 V=s
 
       - name: 编译（单设备）
-        run: make -j$(nproc) || make -j1 V=s
+        run: |
+          set -e
+          # 只清零统计计数器，不清缓存内容，便于看本轮命中率
+          ccache -z >/dev/null 2>&1 || true
+          make -j$(nproc) || make -j1 V=s
+
+      - name: ccache 命中统计
+        if: ${{ always() && inputs.use_cache }}
+        run: |
+          echo "=== 本轮 ccache 统计 ==="
+          ccache -s 2>/dev/null | head -30 || true
+          echo "=== 缓存目录体积 ==="
+          du -sh .ccache dl 2>/dev/null || true
 
       - name: 收集产物
         run: |
@@ -211,10 +265,20 @@ jobs:
             内置 OpenClash、rtp2httpd、Argon 主题及设备当前在用插件；不含其它机型与其它主题。
           files: artifacts/*
 
-      - name: 保存下载缓存
+      # 失败也保存：这次是在 package_compile 阶段挂的，dl 与 ccache 已经攒下，
+      # 存下来后修好补丁重跑就几乎不用重新下载 / 重新编译。
+      - name: 保存下载缓存（dl）
         if: ${{ always() && inputs.use_cache }}
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: dl
-          key: ax3000t-dl-${{ hashFiles('ax3000t.config', 'feeds.conf.default', 'scripts/ax3000t-prune.sh') }}-${{ github.run_number }}
+          key: ax3000t-dl-${{ hashFiles('ax3000t.config', 'feeds.conf.default', 'scripts/ax3000t-prune.sh') }}-${{ github.run_number }}-${{ github.run_attempt }}
+
+      - name: 保存 ccache 编译缓存
+        if: ${{ always() && inputs.use_cache }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ax3000t-ccache-${{ hashFiles('ax3000t.config', 'feeds.conf.default', 'scripts/ax3000t-prune.sh') }}-${{ github.run_number }}-${{ github.run_attempt }}
