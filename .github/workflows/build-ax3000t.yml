@@ -1,0 +1,220 @@
+name: 构建 AX3000T 专属固件
+
+# 只做手动触发：每次仅构建 xiaomi_mi-router-ax3000t（stock layout）一个机型，
+# 不做全 target / 全设备构建，也不在 push 时自动跑。
+on:
+  workflow_dispatch:
+    inputs:
+      use_cache:
+        description: '复用 dl 下载缓存（加速二次构建）'
+        type: boolean
+        default: true
+      release_tag:
+        description: '填写版本号则同时发布 GitHub Release（如 25.12-r1）；留空仅上传 Artifact'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-ax3000t
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+  SRC_DIR: bin/targets/mediatek/filogic
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 释放 runner 磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/share/swift "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean
+          df -h /
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          DEPS="ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+                build-essential bzip2 ccache cmake cpio curl device-tree-compiler \
+                ecj fastjar flex gawk gettext gcc-multilib g++-multilib git gperf \
+                haveged help2man intltool libc6-dev-i386 libelf-dev libglib2.0-dev \
+                libgmp-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev \
+                libreadline-dev libssl-dev libtool lzip lzma ninja-build p7zip-full \
+                patch pkgconf python3 python3-pyelftools python3-setuptools qemu-utils \
+                rsync scons squashfs-tools subversion swig texinfo unzip vim wget \
+                xmlto xxd zlib1g-dev zstd file"
+          LIST=""
+          for p in $DEPS; do
+            if apt-cache show "$p" 2>/dev/null | grep -q '^Package:'; then
+              LIST="$LIST $p"
+            else
+              echo "跳过本系统不可用的依赖：$p"
+            fi
+          done
+          sudo apt-get install -y --no-install-recommends $LIST
+
+      - name: 恢复下载缓存
+        if: ${{ inputs.use_cache }}
+        uses: actions/cache/restore@v4
+        with:
+          path: dl
+          key: ax3000t-dl-${{ hashFiles('ax3000t.config', 'feeds.conf.default', 'scripts/ax3000t-prune.sh') }}-${{ github.run_number }}
+          restore-keys: |
+            ax3000t-dl-${{ hashFiles('ax3000t.config', 'feeds.conf.default', 'scripts/ax3000t-prune.sh') }}-
+            ax3000t-dl-
+
+      - name: 更新 feeds（仅 packages / luci）
+        run: ./scripts/feeds update -a
+
+      - name: 构建时剪裁（架构 / subtarget / 主题 / 内核）
+        run: |
+          chmod +x scripts/ax3000t-prune.sh
+          ./scripts/ax3000t-prune.sh
+
+      - name: 安装 feeds
+        run: ./scripts/feeds install -a
+
+      - name: 载入 AX3000T 专属配置
+        run: |
+          cp ax3000t.config .config
+          make defconfig
+          echo "=== 已启用的设备 ==="
+          grep '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y' .config || true
+
+      - name: 校验剪裁结果（单设备 / 内核符号 / zram 后端 / 禁用包）
+        run: |
+          set -e
+          count=$(grep -c '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y' .config || true)
+          echo "启用设备数：$count"
+          if [ "$count" -ne 1 ]; then
+            echo "错误：应且仅应启用 xiaomi_mi-router-ax3000t 一个设备" >&2
+            exit 1
+          fi
+
+          echo "=== 内核剪裁符号校验 ==="
+          for s in USB_SUPPORT PCI MMC SCSI EXT4_FS F2FS_FS DEBUG_KERNEL DEBUG_FS; do
+            if grep -q "^CONFIG_${s}=y" \
+                 target/linux/mediatek/filogic/config-* target/linux/generic/config-* 2>/dev/null; then
+              echo "错误：内核仍编译了 AX3000T 不存在的子系统 CONFIG_${s}" >&2
+              exit 1
+            fi
+          done
+
+          echo "=== zram 后端校验（lz4 + zstd，默认 lz4，无 lzo / lz4hc） ==="
+          for s in LZ4 ZSTD; do
+            grep -q "^CONFIG_KERNEL_ZRAM_BACKEND_${s}=y" .config || {
+              echo "错误：未启用 zram 后端 ${s}" >&2
+              exit 1
+            }
+          done
+          for s in LZO LZ4HC; do
+            if grep -q "^CONFIG_KERNEL_ZRAM_BACKEND_${s}=y" .config; then
+              echo "错误：多余的 zram 后端 ${s} 被启用" >&2
+              exit 1
+            fi
+          done
+          if grep -q '^CONFIG_KERNEL_ZRAM_BACKEND_FORCE_LZO=y' .config; then
+            echo "错误：FORCE_LZO 生效，会把 lzo 后端重新选回来" >&2
+            exit 1
+          fi
+          grep -q '^CONFIG_KERNEL_ZRAM_DEF_COMP_LZ4=y' .config || {
+            echo "错误：zram 默认压缩器不是 lz4" >&2
+            exit 1
+          }
+          if grep -qE '^CONFIG_KERNEL_ZRAM_DEF_COMP_(LZORLE|LZO|LZ4HC|ZSTD)=y' .config; then
+            echo "错误：zram 默认压缩器存在冲突项" >&2
+            exit 1
+          fi
+          grep -q '^CONFIG_PACKAGE_kmod-lib-lz4=y' .config || {
+            echo "错误：lz4 压缩库 kmod-lib-lz4 未被依赖带入" >&2
+            exit 1
+          }
+
+          echo "=== 禁用包校验 ==="
+          for p in docker dockerd containerd runc docker-compose \
+                   luci-app-docker luci-app-dockerman \
+                   tailscale luci-app-tailscale-community \
+                   zerotier luci-app-zerotier mwan3 luci-app-mwan3; do
+            if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+              echo "错误：已禁用的包被启用：${p}" >&2
+              exit 1
+            fi
+          done
+          echo "全部校验通过"
+
+      - name: 预下载源码包
+        run: make download -j$(nproc) || make download -j1 V=s
+
+      - name: 编译（单设备）
+        run: make -j$(nproc) || make -j1 V=s
+
+      - name: 收集产物
+        run: |
+          set -e
+          if [ ! -d "$SRC_DIR" ]; then
+            echo "错误：未找到 $SRC_DIR" >&2
+            exit 1
+          fi
+          mkdir -p artifacts
+          # 仅取 AX3000T stock layout 产物，排除 ubootmod 变体
+          find "$SRC_DIR" -maxdepth 1 -type f \
+               -name '*ax3000t*' ! -name '*ubootmod*' \
+               -exec cp {} artifacts/ \;
+          # 可复现信息
+          for f in config.buildinfo feeds.buildinfo version.buildinfo profiles.json; do
+            cp "$SRC_DIR/$f" "artifacts/$f" 2>/dev/null || true
+          done
+          cp .config artifacts/ax3000t.config.expanded
+          ./scripts/diffconfig.sh > artifacts/ax3000t.diffconfig 2>/dev/null || true
+          (cd artifacts && find . -maxdepth 1 -type f ! -name sha256sums.txt \
+                -printf '%f\n' | sort | xargs sha256sum > sha256sums.txt)
+          echo "=== 产物清单 ==="
+          ls -lh artifacts/
+          {
+            echo "### AX3000T 专属固件"
+            echo ""
+            echo "源码：\`${{ github.sha }}\` / 仅 mediatek-filogic / 仅 xiaomi_mi-router-ax3000t"
+            echo ""
+            echo '```'
+            ls -lh artifacts/
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传固件
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-ax3000t-${{ github.run_number }}
+          path: artifacts/
+          retention-days: 30
+          compression-level: 0
+
+      - name: 发布 Release
+        if: ${{ inputs.release_tag != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: AX3000T ${{ inputs.release_tag }}
+          body: |
+            ImmortalWrt AX3000T 单设备构建（mediatek/filogic，stock layout）。
+            内置 OpenClash、rtp2httpd、Argon 主题及设备当前在用插件；不含其它机型与其它主题。
+          files: artifacts/*
+
+      - name: 保存下载缓存
+        if: ${{ always() && inputs.use_cache }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: dl
+          key: ax3000t-dl-${{ hashFiles('ax3000t.config', 'feeds.conf.default', 'scripts/ax3000t-prune.sh') }}-${{ github.run_number }}

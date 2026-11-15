@@ -1,8 +1,10 @@
 src-git packages https://github.com/immortalwrt/packages.git
 src-git luci https://github.com/immortalwrt/luci.git
-src-git routing https://github.com/openwrt/routing.git
-src-git telephony https://github.com/openwrt/telephony.git
-src-git video https://github.com/openwrt/video.git
+# AX3000T 专属构建：在用的插件只依赖 packages / luci 两个 feed，
+# routing / telephony / video 无用，注释掉以缩短 feeds 更新与安装时间。
+#src-git routing https://github.com/openwrt/routing.git
+#src-git telephony https://github.com/openwrt/telephony.git
+#src-git video https://github.com/openwrt/video.git
 #src-git targets https://github.com/openwrt/targets.git
 #src-git oldpackages http://git.openwrt.org/packages.git
 #src-link custom /usr/src/openwrt/custom-feed
