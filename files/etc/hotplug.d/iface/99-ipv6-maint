@@ -1,0 +1,16 @@
+#!/bin/sh
+# 不绑定 wan/pppoe-wan 名称；LAN 重建、SLAAC 晚到和接口下线也需要重新协调。
+# 短暂延迟让 netifd 状态稳定；脚本内核锁抑制并发，不假设延迟后 SLAAC 必定就绪。
+case "$ACTION" in
+	ifup|ifdown) ;;
+	ifupdate)
+		[ "$IFUPDATE_ADDRESSES" = 1 ] || [ "$IFUPDATE_PREFIXES" = 1 ] || exit 0
+		;;
+	*) exit 0 ;;
+esac
+(
+	delay=${IPV6_MAINT_DELAY:-2}
+	case "$delay" in ''|*[!0-9]*) delay=2 ;; esac
+	sleep "$delay"
+	/usr/bin/ipv6-maint.sh >/dev/null 2>&1
+) </dev/null >/dev/null 2>&1 &

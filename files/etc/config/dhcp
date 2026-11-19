@@ -1,0 +1,46 @@
+
+config dnsmasq
+	option domainneeded '1'
+	option localise_queries '1'
+	option rebind_protection '1'
+	option rebind_localhost '1'
+	option local '/lan/'
+	option domain 'lan'
+	option expandhosts '1'
+	option min_cache_ttl '3600'
+	option use_stale_cache '3600'
+	option cachesize '0'
+	option nonegcache '1'
+	option authoritative '1'
+	option readethers '1'
+	option leasefile '/tmp/dhcp.leases'
+	option localservice '1'
+	option dns_redirect '1'
+	option ednspacket_max '1232'
+	option localuse '1'
+	option noresolv '1'
+	list server '127.0.0.1#7874'
+
+config dhcp 'lan'
+	option interface 'lan'
+	option dhcpv4 'server'
+	option ra 'server'
+	option max_preferred_lifetime '2700'
+	option max_valid_lifetime '5400'
+	option dhcpv6 'server'
+	option ndp 'disabled'
+	option ra_default '1'
+
+config dhcp 'wan'
+	option interface 'wan'
+	option ignore '1'
+
+config odhcpd 'odhcpd'
+	option leasefile '/tmp/odhcpd.leases'
+	option leasetrigger '/usr/sbin/odhcpd-update'
+	option loglevel '4'
+	option piodir '/tmp/odhcpd-piodir'
+	option hostsdir '/tmp/hosts'
+
+# 静态地址绑定（config host：设备 MAC / IP / 主机名）属各设备私有信息，
+# 不在仓库中维护；由实机自身 /etc/config/dhcp 本地保留。

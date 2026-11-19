@@ -1,0 +1,5 @@
+# IPv6 体系维护（IPv6 下发回程 + IPv6 端口映射，单脚本 ipv6-maint.sh），每 5 分钟一次
+*/5 * * * * /usr/bin/ipv6-maint.sh >/dev/null 2>&1
+
+# 每周一凌晨 5 点定时重启路由器（sleep 70 错开整点 flash 写入，减轻闪存磨损）
+0 5 * * 1 sleep 70 && reboot

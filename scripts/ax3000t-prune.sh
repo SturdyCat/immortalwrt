@@ -100,6 +100,16 @@ exit 0
 EOF
 chmod 0755 files/etc/uci-defaults/99-ax3000t-zram
 
+# 抑制 crond 每 5 分钟一条 "USER root cmd ..." 的执行记录（那不是错误，是默认 -l 7 的详细日志）。
+# 设为 8（busybox crond 最安静级别）后只保留真正的错误，cron 任务本身照常执行。
+cat > files/etc/uci-defaults/99-ax3000t-cronlog <<'EOF'
+#!/bin/sh
+uci -q set system.@system[0].cronloglevel='8'
+uci -q commit system
+exit 0
+EOF
+chmod 0755 files/etc/uci-defaults/99-ax3000t-cronlog
+
 # ---------------------------------------------------------------------------
 # 5) 内核配置剪裁：移除这台机器上根本不存在的硬件子系统
 #
