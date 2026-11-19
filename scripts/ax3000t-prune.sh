@@ -139,7 +139,12 @@ chmod 0755 files/etc/uci-defaults/99-ax3000t-cronlog
 #       MTD_UBI / UBIFS_FS / OVERLAY_FS  squashfs+UBI 根文件系统必需
 #       CGROUPS / NAMESPACES / SECCOMP   procd ujail 服务隔离要用，非 Docker 专属
 #       CRYPTO_DEV_SAFEXCEL             硬件加密加速
-#       NFT_* / TUN / TPROXY / INET_DIAG firewall4 + OpenClash
+#       NFT_*                           firewall4（nftables 防火墙）
+#       NFQUEUE 相关                    honk（eBPF 透明代理，替代 OpenClash）
+#                                       默认开启的"首包保留 UDP"走 NFQUEUE：
+#                                       NFT_QUEUE / NETFILTER_NETLINK_QUEUE
+#       DEBUG_INFO / DEBUG_INFO_BTF     honk 是 eBPF CO-RE 程序，运行时必须
+#                                       能读 /sys/kernel/btf/vmlinux，不能剪
 #       PPP / PPPOE                     WAN 是 PPPoE
 #       MT76 / MT7915E / MT7530 DSA     WiFi + 交换芯片
 #       ZRAM / ZSMALLOC / SWAP          zram-swap
@@ -170,11 +175,13 @@ for sym in \
     MMC MMC_BLOCK MMC_CQHCI MMC_HSQ MMC_MTK \
     SCSI SCSI_COMMON BLK_DEV_SD BLK_DEV_LOOP \
     EXT4_FS F2FS_FS \
-    DEBUG_INFO DEBUG_MISC DEBUG_KERNEL DEBUG_FS DEBUG_FS_ALLOW_ALL \
+    DEBUG_MISC DEBUG_KERNEL DEBUG_FS DEBUG_FS_ALLOW_ALL \
     MAGIC_SYSRQ PRINTK_TIME
 do
     kopt_off "$sym"
 done
+# 注意：DEBUG_INFO 不在剪裁列表 —— CONFIG_KERNEL_DEBUG_INFO_BTF（honk 的
+# eBPF CO-RE 运行时依赖）需要它，二者成对开启，见 ax3000t.config 内核调试块。
 
 # generic/config-* 里还散落着 USB/PCI/SCSI 子项的 savedefconfig 残留（=y）。
 # 总开关关闭后内核 Kconfig 本就会忽略它们，这里显式清掉，让配置干净且可校验。
