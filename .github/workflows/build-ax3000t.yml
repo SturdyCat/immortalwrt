@@ -162,6 +162,25 @@ jobs:
           fi
           echo "=== ccache 配置项 ==="
           grep 'CONFIG_CCACHE' .config || true
+          # honk 是 eBPF CO-RE 程序，运行必须读到 /sys/kernel/btf/vmlinux。
+          # BTF 依赖 DEBUG_INFO=y 且 !DEBUG_INFO_REDUCED；BUILDBOT=n 时 REDUCED
+          # 默认为 y，defconfig 会连带把 seed 里的 BTF 静默丢弃。这里整条依赖链
+          # 一起兜底写回，只写 BTF 而留着 REDUCED=y 仍然不会生效。
+          if ! grep -q '^CONFIG_KERNEL_DEBUG_INFO_BTF=y' .config; then
+            sed -i -e '/^# CONFIG_KERNEL_DEBUG_INFO_REDUCED is not set$/d' -e '/^CONFIG_KERNEL_DEBUG_INFO_REDUCED=/d' .config
+            sed -i -e '/^# CONFIG_KERNEL_DEBUG_INFO_BTF is not set$/d' -e '/^CONFIG_KERNEL_DEBUG_INFO_BTF=/d' .config
+            sed -i -e '/^# CONFIG_KERNEL_DEBUG_INFO is not set$/d' -e '/^CONFIG_KERNEL_DEBUG_INFO=/d' .config
+            cat >> .config <<'EOF'
+          CONFIG_KERNEL_DEBUG_INFO=y
+          # CONFIG_KERNEL_DEBUG_INFO_REDUCED is not set
+          CONFIG_KERNEL_DEBUG_INFO_BTF=y
+          EOF
+            echo "已兜底写回 BTF 依赖链（DEBUG_INFO=y / REDUCED=n / BTF=y）"
+          else
+            echo "CONFIG_KERNEL_DEBUG_INFO_BTF=y 由 make defconfig 保留"
+          fi
+          echo "=== BTF 依赖链 ==="
+          grep -E '^CONFIG_KERNEL_DEBUG_INFO(_BTF|_REDUCED)?' .config || true
           echo "=== 已启用的设备 ==="
           grep '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y' .config || true
 
