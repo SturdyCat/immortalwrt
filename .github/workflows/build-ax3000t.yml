@@ -48,7 +48,26 @@ jobs:
 
       - name: 安装编译依赖
         run: |
-          sudo apt-get update
+          # apt 偶发返回 100（源站超时 / 索引损坏 / dpkg 锁竞争），runner 是临时环境，
+          # 重试即可恢复；同清单在上一轮 run 已成功，优先按环境故障处理。
+          sudo apt-get clean
+          sudo rm -f /var/lib/apt/lists/lock \
+                     /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend \
+                     /var/cache/apt/archives/lock
+          sudo dpkg --configure -a || true
+          ok=0
+          for i in 1 2 3; do
+            if sudo apt-get update -o Acquire::Retries=3; then
+              ok=1
+              break
+            fi
+            echo "apt-get update 第 $i 次失败，重试..."
+          done
+          [ "$ok" -eq 1 ] || {
+            echo '错误：apt-get update 连续 3 次失败' >&2
+            exit 1
+          }
+
           DEPS="ack antlr3 asciidoc autoconf automake autopoint binutils bison \
                 build-essential bzip2 ccache cmake cpio curl device-tree-compiler \
                 ecj fastjar flex gawk gettext gcc-multilib g++-multilib git gperf \
@@ -66,7 +85,23 @@ jobs:
               echo "跳过本系统不可用的依赖：$p"
             fi
           done
-          sudo apt-get install -y --no-install-recommends $LIST
+          # 空 LIST 会让 apt-get install 直接报 100；遇到就显式暴露，别伪装成环境问题。
+          [ -n "$LIST" ] || {
+            echo '错误：没有可安装的依赖，apt 索引可能为空' >&2
+            exit 1
+          }
+          ok=0
+          for i in 1 2 3; do
+            if sudo apt-get install -y --no-install-recommends $LIST; then
+              ok=1
+              break
+            fi
+            echo "apt-get install 第 $i 次失败，重试..."
+          done
+          [ "$ok" -eq 1 ] || {
+            echo '错误：apt-get install 连续 3 次失败' >&2
+            exit 1
+          }
           ccache --version | head -1
 
       - name: 准备缓存目录
@@ -197,6 +232,14 @@ jobs:
               echo "错误：已禁用的包被启用：${p}" >&2
               exit 1
             fi
+          done
+
+          echo "=== DAWN 内置校验（后装会与滚动升级库 ABI 错配而 SIGSEGV） ==="
+          for p in dawn umdns luci-app-dawn luci-i18n-dawn-zh-cn; do
+            grep -q "^CONFIG_PACKAGE_${p}=y" .config || {
+              echo "错误：DAWN 相关包未被编入固件：${p}" >&2
+              exit 1
+            }
           done
           echo "全部校验通过"
 
