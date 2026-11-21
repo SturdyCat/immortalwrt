@@ -241,6 +241,20 @@ jobs:
               exit 1
             }
           done
+
+          echo "=== DNS/DHCP 与 honk 内核依赖校验 ==="
+          # 移除 OpenClash 时曾连基础 dnsmasq 一起删掉，导致固件无 DNS 无 DHCP
+          for p in dnsmasq kmod-nfnetlink-queue kmod-nft-queue kmod-veth; do
+            grep -q "^CONFIG_PACKAGE_${p}=y" .config || {
+              echo "错误：DNS/honk 必需项未被编入固件：${p}" >&2
+              exit 1
+            }
+          done
+          # honk 是 eBPF CO-RE 程序，缺 BTF 时 /sys/kernel/btf/vmlinux 不存在
+          grep -q '^CONFIG_KERNEL_DEBUG_INFO_BTF=y' .config || {
+            echo "错误：内核未开启 DEBUG_INFO_BTF，honk 的 eBPF 无法运行" >&2
+            exit 1
+          }
           echo "全部校验通过"
 
       - name: 预下载源码包
@@ -293,8 +307,20 @@ jobs:
           # 「构建成功但 Release 为空」；手填版本号则沿用自定义 tag。
           TAG="$INPUT_TAG"
           [ -n "$TAG" ] || TAG="snapshot-r${RUN_NO}"
-          SAFE=$(printf '%s' "$TAG" | tr -c 'A-Za-z0-9._-' '_')
-          PKG="immortalwrt-ax3000t-${SAFE}.7z"
+
+          # 包名与 Release tag / run number 解耦，固定为
+          #   immortalwrt-ax3000t-<固件版本号>-<构建日期 YYYYMMDD>.7z
+          # 版本号取自编译产物 version.buildinfo 的 VERSION_NUMBER（SNAPSHOT
+          # 或 25.12.2 之类），由 include/version.mk 生成；日期用 env 里的
+          # TZ=Asia/Shanghai。tag 仍只用于 GitHub Release 的 tag/name。
+          VER=$(grep -m1 '^VERSION_NUMBER=' "$SRC_DIR/version.buildinfo" 2>/dev/null \
+                | sed -e "s/^VERSION_NUMBER=//" -e "s/^'//" -e "s/'$//" \
+                      -e 's/^"//' -e 's/"$//')
+          [ -n "$VER" ] || VER="SNAPSHOT"
+          BUILD_DATE=$(date +%Y%m%d)
+          SAFE_VER=$(printf '%s' "$VER" | tr -c 'A-Za-z0-9._-' '_')
+          PKG="immortalwrt-ax3000t-${SAFE_VER}-${BUILD_DATE}.7z"
+          echo "构建包名：$PKG（固件版本 $VER / 构建日期 $BUILD_DATE）"
 
           # ubuntu-24.04 的 7zip 包提供 7z / 7zz；p7zip-full 是旧版兼容项。
           SZ=""
@@ -312,6 +338,7 @@ jobs:
           ls -lh release/
 
           echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "release_title=${VER}-${BUILD_DATE}" >> "$GITHUB_OUTPUT"
           {
             echo "### AX3000T 专属固件"
             echo ""
@@ -341,7 +368,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.collect.outputs.release_tag }}
-          name: AX3000T ${{ steps.collect.outputs.release_tag }}
+          name: AX3000T ${{ steps.collect.outputs.release_title }}
           body: |
             ImmortalWrt AX3000T 单设备构建（mediatek/filogic，stock layout）。
             内置 OpenClash、rtp2httpd、Argon 主题及设备当前在用插件；不含其它机型与其它主题。
